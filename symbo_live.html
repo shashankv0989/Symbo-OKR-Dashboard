@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Symbo Partner Intelligence</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}
+  body{background:#f0f4f8;min-height:100vh}
+  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar-track{background:#e4edf5}
+  ::-webkit-scrollbar-thumb{background:#a0bdd4;border-radius:2px}
+  .card{background:#fff;border:1px solid #cddae6;border-radius:12px}
+  .kpi-card{transition:border-color .2s,box-shadow .2s}
+  .kpi-card:hover{border-color:#00a87480!important;box-shadow:0 0 20px #00a87415}
+  .tab-btn{transition:all .2s;font-family:'Segoe UI',system-ui,sans-serif}
+  .tab-btn:hover{background:#daeaf5!important}
+  .row-hover:hover{background:#daeaf5!important;cursor:pointer}
+  .filter-sel{background:#fff;border:1px solid #cddae6;color:#0d2233;border-radius:8px;padding:6px 10px;font-size:13px;outline:none;cursor:pointer}
+  .filter-sel:focus{border-color:#00a874}
+  .filter-sel option{background:#fff}
+  .spinner{width:40px;height:40px;border:4px solid #e4edf5;border-top:4px solid #00a874;border-radius:50%;animation:spin 0.8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .pulse{animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+const { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+        PieChart, Pie, Cell, Legend, CartesianGrid, ReferenceLine, LineChart, Line } = Recharts;
+
+// ─── CONFIG ─────────────────────────────────────────────
+const SHEET_ID = "1cXODisd4GLUbNcaT7MrYCqbYnOuNWThnIE6IT1adv0Q";
+const SHEET_GWP = "From_Jan2021_Premium";
+const SHEET_NOP = "From_Jan2021_NOP";
+const SHEET_ACC = "Account List";
+
+// ─── COLORS ─────────────────────────────────────────────
+const C = {
+  bg:"#f0f4f8", card:"#ffffff", border:"#cddae6", surface:"#e4edf5",
+  green:"#00a874", yellow:"#c49a00", danger:"#d93055", accent:"#2e7fa8",
+  text:"#0d2233", muted:"#5a7a90", dim:"#2d5a72",
+};
+const PALETTE = ["#00a874","#c49a00","#2e7fa8","#d93055","#7c5cbf","#d4650a","#1a9e70","#c2326e"];
+
+// ─── HELPERS ────────────────────────────────────────────
+const cleanNum = v => {
+  if (v === null || v === undefined || v === '') return 0;
+  if (typeof v === 'number') return Math.round(v);
+  if (typeof v === 'string') return parseInt(v.replace(/,/g,'')) || 0;
+  return 0;
+};
+const cr = v => `₹${(v/1e7).toFixed(1)}Cr`;
+const crFull = v => `₹${(v/1e7).toFixed(2)}Cr`;
+const fmtNop = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1000 ? `${(v/1000).toFixed(0)}K` : String(v);
+const mo = m => { const [y,mn]=m.split('-'); const n=["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]; return `${n[+mn]}'${y.slice(2)}`; };
+
+// ─── DATA FETCHING ──────────────────────────────────────
+async function fetchGvizSheet(sheetName) {
+  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
+  const res = await fetch(url);
+  const text = await res.text();
+  const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]*?)\);?\s*$/);
+  if (!match) throw new Error(`Could not parse sheet: ${sheetName}`);
+  return JSON.parse(match[1]);
+}
+
+function gvizRows(gvizData) {
+  return (gvizData.table.rows || []).map(row =>
+    (row.c || []).map(cell => cell ? (cell.v !== null && cell.v !== undefined ? cell.v : cell.f) : null)
+  );
+}
+
+function processData(gwpRows, nopRows, accRows) {
+  // Col mapping: 0=Client,1=Program,2=Account,3=Vertical,4=PodLead,5=PSM,6=Status,
+  // 7=SaleStart,8=Type,9=InsurerId,10=LastPolicyMonth, 11..72=Jan2021..Feb2026, 73=Mar2026(partial), 74=Total
+  const DATA_COLS = Array.from({length:62}, (_,i) => i+11); // Jan2021(11) to Feb2026(72)
+  const col2ym = idx => { const m=idx-11; const y=2021+Math.floor(m/12); const mo=1+(m%12); return `${y}-${String(mo).padStart(2,'0')}`; };
+  const MONTH_LABELS = DATA_COLS.map(col2ym);
+  const RECENT_MONTHS = MONTH_LABELS.slice(36); // Jan2024 to Feb2026 (26 months)
+  const RECENT_COLS = DATA_COLS.slice(36);
+  const fy26Start = MONTH_LABELS.indexOf('2025-04');
+  const fy26End = MONTH_LABELS.indexOf('2026-02');
+  const FY26_COLS = DATA_COLS.slice(fy26Start, fy26End+1);
+
+  // Account list meta
+  const accMeta = {};
+  for (let i=1; i<accRows.length; i++) {
+    const r = accRows[i];
+    const client = String(r[0]||'').trim();
+    const prog = String(r[1]||'').trim();
+    if (client && prog) {
+      accMeta[`${client}|||${prog}`] = {
+        vertical: String(r[4]||'').trim(),
+        podLead:  String(r[5]||'').trim(),
+        psm:      String(r[6]||'').trim(),
+        status:   String(r[7]||'').trim(),
+      };
+    }
+  }
+
+  // Merge duplicate programs
+  const progMap = {};
+  for (let ri=1; ri<gwpRows.length; ri++) {
+    const r = gwpRows[ri];
+    const client = String(r[0]||'').trim();
+    const prog   = String(r[1]||'').trim();
+    if (!client || client==='null') continue;
+
+    const key = `${client}|||${prog}`;
+    const meta = accMeta[key] || {};
+
+    const gwpNopRow = nopRows[ri] || [];
+    const totalGwp = DATA_COLS.reduce((s,c) => s + cleanNum(r[c]), 0);
+    const totalNop = DATA_COLS.reduce((s,c) => s + cleanNum(gwpNopRow[c]), 0);
+    const fy26Gwp  = FY26_COLS.reduce((s,c) => s + cleanNum(r[c]), 0);
+    const fy26Nop  = FY26_COLS.reduce((s,c) => s + cleanNum(gwpNopRow[c]), 0);
+    const recentGwp = RECENT_COLS.map(c => cleanNum(r[c]));
+    const recentNop = RECENT_COLS.map(c => cleanNum(gwpNopRow[c]));
+
+    if (progMap[key]) {
+      const p = progMap[key];
+      p.totalGwp += totalGwp; p.totalNop += totalNop;
+      p.fy26Gwp  += fy26Gwp;  p.fy26Nop  += fy26Nop;
+      p.recentGwp = p.recentGwp.map((v,i) => v + recentGwp[i]);
+      p.recentNop = p.recentNop.map((v,i) => v + recentNop[i]);
+    } else {
+      progMap[key] = {
+        client, program: prog,
+        vertical: meta.vertical || String(r[3]||'').trim(),
+        podLead:  meta.podLead  || String(r[4]||'').trim(),
+        psm:      meta.psm      || String(r[5]||'').trim(),
+        status:   meta.status   || String(r[6]||'').trim(),
+        totalGwp, totalNop, fy26Gwp, fy26Nop, recentGwp, recentNop,
+      };
+    }
+  }
+  const programs = Object.values(progMap).filter(p => p.totalGwp > 0 || p.fy26Gwp > 0);
+
+  // Monthly trend (all 62 months)
+  const trendData = MONTH_LABELS.map((ym, i) => {
+    const col = DATA_COLS[i];
+    const gwp = gwpRows.slice(1).reduce((s,r) => s + cleanNum(r[col]), 0);
+    const nop = nopRows.slice(1).reduce((s,r) => s + cleanNum(r[col]), 0);
+    return { month: ym, gwp, nop };
+  });
+
+  return { programs, trendData, recentMonths: RECENT_MONTHS };
+}
+
+// ─── CUSTOM TOOLTIP ─────────────────────────────────────
+const ChartTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{background:'#fff',border:`1px solid ${C.border}`,borderRadius:8,padding:'10px 14px',boxShadow:'0 4px 12px #0001'}}>
+      <p style={{margin:0,color:C.muted,fontSize:12}}>{label}</p>
+      {payload.map((p,i) => (
+        <p key={i} style={{margin:'4px 0 0',fontSize:13,fontWeight:700,color:p.color}}>
+          {p.name}: {p.name==='GWP' ? `₹${p.value.toFixed(1)}Cr` : fmtNop(p.value)}
+        </p>
+      ))}
+    </div>
+  );
+};
+
+// ─── MAIN APP ────────────────────────────────────────────
+function App() {
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState(null);
+  const [programs, setPrograms] = useState([]);
+  const [trendData, setTrend]   = useState([]);
+  const [recentMonths, setRM]   = useState([]);
+  const [lastRefresh, setRefresh] = useState('');
+
+  const [fVertical, setFV] = useState('All');
+  const [fPod, setFP]      = useState('All');
+  const [fStatus, setFS]   = useState('All');
+  const [fClient, setFC]   = useState('All');
+  const [tab, setTab]      = useState('executive');
+  const [drill, setDrill]  = useState(null);
+
+  async function loadData() {
+    setLoading(true); setError(null);
+    try {
+      const [gwpRes, nopRes, accRes] = await Promise.all([
+        fetchGvizSheet(SHEET_GWP),
+        fetchGvizSheet(SHEET_NOP),
+        fetchGvizSheet(SHEET_ACC),
+      ]);
+      const gwpRows = gvizRows(gwpRes);
+      const nopRows = gvizRows(nopRes);
+      const accRows = gvizRows(accRes);
+      const { programs, trendData, recentMonths } = processData(gwpRows, nopRows, accRows);
+      setPrograms(programs);
+      setTrend(trendData);
+      setRM(recentMonths);
+      setRefresh(new Date().toLocaleString('en-IN', {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}));
+    } catch(e) {
+      setError(e.message);
+    }
+    setLoading(false);
+  }
+
+  useEffect(() => { loadData(); }, []);
+
+  const verticals = useMemo(() => ['All', ...Array.from(new Set(programs.map(p=>p.vertical).filter(Boolean))).sort()], [programs]);
+  const pods      = useMemo(() => ['All', ...Array.from(new Set(programs.map(p=>p.podLead).filter(Boolean))).sort()], [programs]);
+  const clients   = useMemo(() => ['All', ...Array.from(new Set(programs.map(p=>p.client).filter(Boolean))).sort()], [programs]);
+
+  const filtered = useMemo(() => programs.filter(p =>
+    (fVertical==='All' || p.vertical===fVertical) &&
+    (fPod==='All'      || p.podLead===fPod)       &&
+    (fStatus==='All'   || p.status===fStatus)     &&
+    (fClient==='All'   || p.client===fClient)
+  ), [programs, fVertical, fPod, fStatus, fClient]);
+
+  const kpis = useMemo(() => {
+    const ytdGwp  = filtered.reduce((s,p) => s + p.fy26Gwp, 0);
+    const ytdNop  = filtered.reduce((s,p) => s + p.fy26Nop, 0);
+    const totalGwp= filtered.reduce((s,p) => s + p.totalGwp, 0);
+    const feb26   = filtered.reduce((s,p) => s + (p.recentGwp[25]||0), 0);
+    const jan26   = filtered.reduce((s,p) => s + (p.recentGwp[24]||0), 0);
+    const mom     = jan26>0 ? (feb26-jan26)/jan26*100 : 0;
+    const avgPrem = ytdNop>0 ? ytdGwp/ytdNop : 0;
+    const active  = filtered.filter(p=>p.status==='Live').length;
+    const churn   = filtered.filter(p=>p.status==='Churn').length;
+    return { ytdGwp, ytdNop, totalGwp, feb26, jan26, mom, avgPrem, active, churn };
+  }, [filtered]);
+
+  const clientData = useMemo(() => {
+    const map = {};
+    for (const p of filtered) {
+      if (!map[p.client]) map[p.client] = { client:p.client, gwp:0, nop:0, ytd:0, status:p.status };
+      map[p.client].gwp += p.totalGwp;
+      map[p.client].nop += p.totalNop;
+      map[p.client].ytd += p.fy26Gwp;
+    }
+    return Object.values(map).sort((a,b) => b.gwp - a.gwp);
+  }, [filtered]);
+
+  const verticalData = useMemo(() => {
+    const map = {};
+    for (const p of filtered) { const v=p.vertical||'Other'; map[v]=(map[v]||0)+p.totalGwp; }
+    return Object.entries(map).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
+  }, [filtered]);
+
+  const podData = useMemo(() => {
+    const map = {};
+    for (const p of filtered) {
+      const pl = p.podLead||'Unknown';
+      if (!map[pl]) map[pl] = {pod:pl,gwp:0,ytd:0,active:0,churn:0};
+      map[pl].gwp += p.totalGwp; map[pl].ytd += p.fy26Gwp;
+      if (p.status==='Live') map[pl].active++; else map[pl].churn++;
+    }
+    return Object.values(map).sort((a,b)=>b.gwp-a.gwp);
+  }, [filtered]);
+
+  const fullTrend = useMemo(() => trendData.map(td => ({ month:mo(td.month), gwp:td.gwp/1e7, nop:td.nop })), [trendData]);
+
+  const trendChart = useMemo(() => {
+    if (!recentMonths.length) return [];
+    return recentMonths.map((ym, mi) => {
+      const gwp = filtered.reduce((s,p) => s+(p.recentGwp[mi+0]||0), 0);
+      const nop = filtered.reduce((s,p) => s+(p.recentNop[mi+0]||0), 0);
+      return { month: mo(ym), gwp: gwp/1e7, nop };
+    });
+  }, [filtered, recentMonths]);
+
+  // Actually trendChart should use the recentMonths index properly
+  const trendChartFixed = useMemo(() => {
+    return recentMonths.map((ym, i) => {
+      const gwp = filtered.reduce((s,p) => s+(p.recentGwp[i]||0), 0);
+      const nop = filtered.reduce((s,p) => s+(p.recentNop[i]||0), 0);
+      return { month: mo(ym), gwp: gwp/1e7, nop };
+    });
+  }, [filtered, recentMonths]);
+
+  const totalClientGwp = clientData.reduce((s,c)=>s+c.gwp,0);
+  const top3Pct = clientData.slice(0,3).reduce((s,c)=>s+c.gwp,0) / (totalClientGwp||1) * 100;
+  const top5Pct = clientData.slice(0,5).reduce((s,c)=>s+c.gwp,0) / (totalClientGwp||1) * 100;
+
+  const declining = useMemo(() => filtered.filter(p => {
+    if (p.status!=='Live') return false;
+    const recent = p.recentGwp.slice(-6).filter(v=>v>0);
+    if (recent.length<3) return false;
+    const l = recent.slice(-3);
+    return l[2]<l[1] && l[1]<l[0] && l[0]>500000;
+  }).map(p => {
+    const l = p.recentGwp.slice(-6).filter(v=>v>0).slice(-3);
+    return { ...p, drop: ((l[2]-l[0])/l[0]*100).toFixed(0) };
+  }).sort((a,b)=>b.totalGwp-a.totalGwp).slice(0,8), [filtered]);
+
+  const drillPrograms = useMemo(() =>
+    drill ? filtered.filter(p=>p.client===drill).sort((a,b)=>b.totalGwp-a.totalGwp) : [],
+    [filtered, drill]
+  );
+
+  const TABS = [
+    {id:'executive', label:'📊 Executive'},
+    {id:'clients',   label:'👥 Clients'},
+    {id:'risk',      label:'⚠️ Risk Intel'},
+    {id:'pods',      label:'🏆 Pods'},
+  ];
+
+  // ─── LOADING ──────────────────────────────────────────
+  if (loading) return (
+    <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100vh',gap:16}}>
+      <div className="spinner"/>
+      <div style={{color:C.muted,fontSize:14,fontWeight:600}}>Fetching live data from Google Sheets...</div>
+      <div style={{color:C.muted,fontSize:12}}>Connecting to Symbo Partner sheet</div>
+    </div>
+  );
+
+  if (error) return (
+    <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100vh',gap:16,padding:32}}>
+      <div style={{fontSize:48}}>⚠️</div>
+      <div style={{color:C.danger,fontSize:18,fontWeight:700}}>Failed to load sheet data</div>
+      <div style={{color:C.muted,fontSize:13,maxWidth:400,textAlign:'center'}}>{error}</div>
+      <div style={{color:C.muted,fontSize:12,maxWidth:400,textAlign:'center'}}>Make sure the Google Sheet is set to "Anyone with the link can view"</div>
+      <button onClick={loadData} style={{background:C.green,color:'#fff',border:'none',borderRadius:8,padding:'10px 24px',fontWeight:700,cursor:'pointer',fontSize:14}}>
+        Retry
+      </button>
+    </div>
+  );
+
+  // ─── MAIN RENDER ──────────────────────────────────────
+  return (
+    <div style={{background:C.bg,minHeight:'100vh',color:C.text}}>
+
+      {/* HEADER */}
+      <div style={{background:'linear-gradient(135deg,#e4edf5 0%,#cfe0ef 100%)',borderBottom:`1px solid ${C.border}`,padding:'18px 28px'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',maxWidth:1400,margin:'0 auto'}}>
+          <div style={{display:'flex',alignItems:'center',gap:12}}>
+            <div style={{width:38,height:38,background:`linear-gradient(135deg,${C.green},#00805a)`,borderRadius:10,display:'flex',alignItems:'center',justifyContent:'center',fontSize:20}}>⚡</div>
+            <div>
+              <div style={{fontSize:20,fontWeight:800,color:C.text,letterSpacing:-0.5}}>Symbo Partner Intelligence</div>
+              <div style={{fontSize:11,color:C.muted,marginTop:2}}>
+                Live Dashboard · {programs.length} Programs · {new Set(programs.map(p=>p.client)).size} Clients
+                {lastRefresh && <span style={{marginLeft:8,color:C.green,fontWeight:600}}>● Updated {lastRefresh}</span>}
+              </div>
+            </div>
+          </div>
+          <div style={{display:'flex',gap:16,alignItems:'center'}}>
+            <div style={{textAlign:'right'}}>
+              <div style={{fontSize:11,color:C.muted}}>All-Time GWP</div>
+              <div style={{fontSize:20,fontWeight:800,color:C.green}}>{cr(programs.reduce((s,p)=>s+p.totalGwp,0))}</div>
+            </div>
+            <div style={{width:1,height:32,background:C.border}}/>
+            <div style={{textAlign:'right'}}>
+              <div style={{fontSize:11,color:C.muted}}>FY2026 GWP</div>
+              <div style={{fontSize:20,fontWeight:800,color:C.yellow}}>{cr(programs.reduce((s,p)=>s+p.fy26Gwp,0))}</div>
+            </div>
+            <button onClick={loadData} title="Refresh from sheet"
+              style={{background:C.green,color:'#fff',border:'none',borderRadius:8,padding:'8px 14px',fontWeight:700,cursor:'pointer',fontSize:12,display:'flex',alignItems:'center',gap:6}}>
+              🔄 Refresh
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* FILTERS */}
+      <div style={{background:'#daeaf5',borderBottom:`1px solid ${C.border}`,padding:'10px 28px'}}>
+        <div style={{display:'flex',gap:10,alignItems:'center',flexWrap:'wrap',maxWidth:1400,margin:'0 auto'}}>
+          <span style={{fontSize:12,color:C.muted,fontWeight:600}}>FILTERS</span>
+          {[
+            {label:'Vertical', val:fVertical, set:setFV, opts:verticals},
+            {label:'Pod Lead', val:fPod,      set:setFP, opts:pods},
+            {label:'Status',   val:fStatus,   set:setFS, opts:['All','Live','Churn']},
+            {label:'Client',   val:fClient,   set:setFC, opts:clients.slice(0,50)},
+          ].map(({label,val,set,opts}) => (
+            <div key={label} style={{display:'flex',alignItems:'center',gap:6}}>
+              <span style={{fontSize:11,color:C.muted}}>{label}</span>
+              <select className="filter-sel" value={val} onChange={e=>{set(e.target.value);setDrill(null);}}>
+                {opts.map(o=><option key={o} value={o}>{o}</option>)}
+              </select>
+            </div>
+          ))}
+          {(fVertical!=='All'||fPod!=='All'||fStatus!=='All'||fClient!=='All') && (
+            <button onClick={()=>{setFV('All');setFP('All');setFS('All');setFC('All');setDrill(null);}}
+              style={{fontSize:11,color:C.danger,background:'transparent',border:`1px solid ${C.danger}40`,borderRadius:6,padding:'4px 10px',cursor:'pointer'}}>
+              Clear ✕
+            </button>
+          )}
+          <div style={{marginLeft:'auto',fontSize:12,color:C.muted}}>{filtered.length} programs · {clientData.length} clients</div>
+        </div>
+      </div>
+
+      <div style={{maxWidth:1400,margin:'0 auto',padding:'20px 28px'}}>
+
+        {/* KPI CARDS */}
+        <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:12,marginBottom:20}}>
+          {[
+            {label:'GWP (FY2026)',        value:cr(kpis.ytdGwp),              sub:'Apr 2025 – Feb 2026',       color:C.green,  icon:'💰'},
+            {label:'NOP (FY2026)',        value:fmtNop(kpis.ytdNop),           sub:'Number of Policies',        color:C.yellow, icon:'📋'},
+            {label:'Avg Premium/Policy',  value:`₹${kpis.avgPrem.toFixed(0)}`, sub:'GWP ÷ NOP FY2026',         color:C.green,  icon:'📊'},
+            {label:'Active Programs',     value:kpis.active,                   sub:`${kpis.churn} churned`,     color:'#7c5cbf',icon:'✅'},
+            {label:'MoM Feb vs Jan',      value:`${kpis.mom>0?'+':''}${kpis.mom.toFixed(1)}%`,
+                                                                               sub:"Jan'26 → Feb'26",           color:kpis.mom>=0?C.green:C.danger, icon:kpis.mom>=0?'📈':'📉'},
+          ].map(({label,value,sub,color,icon})=>(
+            <div key={label} className="card kpi-card" style={{padding:'16px 18px',borderLeft:`3px solid ${color}`}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                <div style={{fontSize:11,color:C.muted,fontWeight:600,textTransform:'uppercase',letterSpacing:.5}}>{label}</div>
+                <span style={{fontSize:18}}>{icon}</span>
+              </div>
+              <div style={{fontSize:26,fontWeight:800,color,marginTop:6,lineHeight:1}}>{value}</div>
+              <div style={{fontSize:11,color:C.muted,marginTop:6}}>{sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* TABS */}
+        <div style={{display:'flex',gap:4,marginBottom:16,borderBottom:`1px solid ${C.border}`}}>
+          {TABS.map(t=>(
+            <button key={t.id} className="tab-btn" onClick={()=>{setTab(t.id);setDrill(null);}}
+              style={{background:tab===t.id?'#daeaf5':'transparent',color:tab===t.id?C.green:C.muted,
+                border:'none',borderBottom:tab===t.id?`2px solid ${C.green}`:'2px solid transparent',
+                cursor:'pointer',padding:'10px 18px',fontSize:13,fontWeight:600,borderRadius:'8px 8px 0 0'}}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── EXECUTIVE TAB ── */}
+        {tab==='executive' && (
+          <div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:12,marginBottom:12}}>
+              {/* Full trend chart */}
+              <div className="card" style={{padding:18,gridColumn:'span 2'}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:14}}>GWP Monthly Trend — All Time (₹ Crore)</div>
+                <ResponsiveContainer width="100%" height={210}>
+                  <AreaChart data={fullTrend} margin={{left:-10}}>
+                    <defs>
+                      <linearGradient id="gwpGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={C.green} stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor={C.green} stopOpacity={0.02}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#d0dde8"/>
+                    <XAxis dataKey="month" tick={{fontSize:9,fill:C.muted}} interval={5}/>
+                    <YAxis tick={{fontSize:9,fill:C.muted}} tickFormatter={v=>`₹${v.toFixed(0)}Cr`}/>
+                    <Tooltip content={<ChartTooltip/>}/>
+                    <ReferenceLine x="Jun'23" stroke={C.yellow} strokeDasharray="4 4" label={{value:'Mpokkt live',fill:C.yellow,fontSize:9}}/>
+                    <Area type="monotone" dataKey="gwp" name="GWP" stroke={C.green} fill="url(#gwpGrad)" strokeWidth={2} dot={false}/>
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+              {/* Vertical donut */}
+              <div className="card" style={{padding:18}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:10}}>GWP by Vertical</div>
+                <ResponsiveContainer width="100%" height={160}>
+                  <PieChart>
+                    <Pie data={verticalData} dataKey="value" nameKey="name" cx="45%" cy="50%" innerRadius={45} outerRadius={72}
+                      label={({name,percent})=>`${name} ${(percent*100).toFixed(0)}%`} labelLine={false} fontSize={9}>
+                      {verticalData.map((_,i)=><Cell key={i} fill={PALETTE[i%PALETTE.length]}/>)}
+                    </Pie>
+                    <Tooltip formatter={v=>cr(v)}/>
+                  </PieChart>
+                </ResponsiveContainer>
+                <div style={{marginTop:6}}>
+                  {verticalData.map((v,i)=>(
+                    <div key={v.name} style={{display:'flex',justifyContent:'space-between',padding:'3px 0',borderBottom:`1px solid ${C.border}`}}>
+                      <div style={{display:'flex',alignItems:'center',gap:6}}>
+                        <div style={{width:8,height:8,borderRadius:2,background:PALETTE[i%PALETTE.length]}}/>
+                        <span style={{fontSize:11,color:C.dim}}>{v.name}</span>
+                      </div>
+                      <span style={{fontSize:11,fontWeight:700,color:PALETTE[i%PALETTE.length]}}>{cr(v.value)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+              {/* Pod bar */}
+              <div className="card" style={{padding:18}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:14}}>Pod Lead Performance — Total GWP</div>
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={podData} layout="vertical" margin={{left:10,right:10}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#d0dde8" horizontal={false}/>
+                    <XAxis type="number" tick={{fontSize:9,fill:C.muted}} tickFormatter={v=>`₹${v.toFixed(0)}Cr`}/>
+                    <YAxis type="category" dataKey="pod" tick={{fontSize:11,fill:C.dim}} width={80}/>
+                    <Tooltip formatter={v=>cr(v*1e7)}/>
+                    <Bar dataKey={d=>d.gwp/1e7} name="GWP" radius={[0,4,4,0]}>
+                      {podData.map((_,i)=><Cell key={i} fill={PALETTE[i%PALETTE.length]}/>)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              {/* NOP trend */}
+              <div className="card" style={{padding:18}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:14}}>NOP Trend — Last 26 Months</div>
+                <ResponsiveContainer width="100%" height={200}>
+                  <AreaChart data={trendChartFixed} margin={{left:-10}}>
+                    <defs>
+                      <linearGradient id="nopGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={C.yellow} stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor={C.yellow} stopOpacity={0.02}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#d0dde8"/>
+                    <XAxis dataKey="month" tick={{fontSize:9,fill:C.muted}} interval={4}/>
+                    <YAxis tick={{fontSize:9,fill:C.muted}} tickFormatter={v=>fmtNop(v)}/>
+                    <Tooltip content={<ChartTooltip/>}/>
+                    <Area type="monotone" dataKey="nop" name="NOP" stroke={C.yellow} fill="url(#nopGrad)" strokeWidth={2} dot={false}/>
+                  </AreaChart>
+                </ResponsiveContainer>
+                <div style={{marginTop:14,display:'flex',gap:8}}>
+                  {[
+                    {label:'Feb 2026 NOP',   value:fmtNop(filtered.reduce((s,p)=>s+(p.recentNop[25]||0),0)), color:C.green},
+                    {label:'Jan 2026 NOP',   value:fmtNop(filtered.reduce((s,p)=>s+(p.recentNop[24]||0),0)), color:C.accent},
+                    {label:'FY2026 Total',   value:fmtNop(kpis.ytdNop),                                      color:C.yellow},
+                  ].map(({label,value,color})=>(
+                    <div key={label} style={{flex:1,background:C.surface,borderRadius:8,padding:'8px 10px'}}>
+                      <div style={{fontSize:10,color:C.muted}}>{label}</div>
+                      <div style={{fontSize:16,fontWeight:800,color}}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── CLIENTS TAB ── */}
+        {tab==='clients' && (
+          <div>
+            <div style={{display:'grid',gridTemplateColumns:'3fr 2fr',gap:12,marginBottom:12}}>
+              <div className="card" style={{padding:18}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:14}}>Top 10 Clients by All-Time GWP — click to drill down</div>
+                {clientData.slice(0,10).map((c,i)=>{
+                  const pct = (c.gwp/totalClientGwp*100).toFixed(1);
+                  return (
+                    <div key={c.client} className="row-hover" onClick={()=>setDrill(drill===c.client?null:c.client)}
+                      style={{marginBottom:10,cursor:'pointer',padding:'6px 8px',borderRadius:6,
+                        background:drill===c.client?C.surface:'transparent',border:drill===c.client?`1px solid ${C.green}30`:'1px solid transparent'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                        <div style={{display:'flex',alignItems:'center',gap:8}}>
+                          <div style={{width:20,height:20,borderRadius:4,background:PALETTE[i%PALETTE.length]+'30',color:PALETTE[i%PALETTE.length],display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:800}}>{i+1}</div>
+                          <span style={{fontSize:13,fontWeight:600,color:C.text}}>{c.client}</span>
+                          {c.status==='Churn' && <span style={{fontSize:9,color:C.danger,background:C.danger+'20',padding:'1px 5px',borderRadius:3}}>CHURN</span>}
+                        </div>
+                        <div style={{textAlign:'right'}}>
+                          <span style={{fontSize:13,fontWeight:800,color:PALETTE[i%PALETTE.length]}}>{cr(c.gwp)}</span>
+                          <span style={{fontSize:10,color:C.muted,marginLeft:6}}>{pct}%</span>
+                        </div>
+                      </div>
+                      <div style={{height:6,background:C.surface,borderRadius:3,overflow:'hidden'}}>
+                        <div style={{height:'100%',width:`${Math.min(parseFloat(pct),100)}%`,background:PALETTE[i%PALETTE.length],borderRadius:3}}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:12}}>
+                <div className="card" style={{padding:18,border:top3Pct>70?`1px solid ${C.danger}60`:`1px solid ${C.border}`}}>
+                  <div style={{fontSize:13,fontWeight:700,color:top3Pct>70?C.danger:C.dim,marginBottom:12}}>
+                    {top3Pct>70?'⚠️':'📊'} Revenue Concentration Risk
+                  </div>
+                  {[
+                    {label:'Top 1 Client', pct:clientData.slice(0,1).reduce((s,c)=>s+c.gwp,0)/(totalClientGwp||1)*100},
+                    {label:'Top 3 Clients',pct:top3Pct},
+                    {label:'Top 5 Clients',pct:top5Pct},
+                    {label:'Top 10 Clients',pct:clientData.slice(0,10).reduce((s,c)=>s+c.gwp,0)/(totalClientGwp||1)*100},
+                  ].map(({label,pct})=>(
+                    <div key={label} style={{marginBottom:10}}>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                        <span style={{fontSize:12,color:C.dim}}>{label}</span>
+                        <span style={{fontSize:13,fontWeight:800,color:pct>75?C.danger:pct>50?C.yellow:C.green}}>{pct.toFixed(1)}%</span>
+                      </div>
+                      <div style={{height:8,background:C.surface,borderRadius:4,overflow:'hidden'}}>
+                        <div style={{height:'100%',width:`${pct}%`,background:pct>75?C.danger:pct>50?C.yellow:C.green,borderRadius:4}}/>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="card" style={{padding:18,flex:1}}>
+                  <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:12}}>FY2026 YTD — Top Clients</div>
+                  {clientData.filter(c=>c.ytd>0).slice(0,6).map((c,i)=>(
+                    <div key={c.client} style={{display:'flex',justifyContent:'space-between',padding:'7px 0',borderBottom:`1px solid ${C.border}`}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8}}>
+                        <span style={{fontSize:10,color:C.muted,width:16}}>#{i+1}</span>
+                        <span style={{fontSize:12,color:C.text}}>{c.client}</span>
+                      </div>
+                      <span style={{fontSize:13,fontWeight:800,color:PALETTE[i%PALETTE.length]}}>{cr(c.ytd)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            {drill && (
+              <div className="card" style={{padding:18,marginBottom:12,border:`1px solid ${C.green}40`}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+                  <div style={{fontSize:14,fontWeight:800,color:C.green}}>🔍 {drill} — Program Breakdown</div>
+                  <button onClick={()=>setDrill(null)} style={{background:'transparent',border:`1px solid ${C.border}`,color:C.muted,borderRadius:6,padding:'4px 10px',cursor:'pointer',fontSize:11}}>Close ✕</button>
+                </div>
+                <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(240px,1fr))',gap:10}}>
+                  {drillPrograms.map((p,i)=>{
+                    const last3 = p.recentGwp.slice(-3).filter(v=>v>0);
+                    const t3m = last3.length>1 ? ((last3[last3.length-1]-last3[0])/last3[0]*100).toFixed(0) : 0;
+                    return (
+                      <div key={p.program} style={{background:C.surface,borderRadius:10,padding:'12px 14px',borderLeft:`3px solid ${p.status==='Live'?C.green:C.danger}`}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
+                          <div style={{fontSize:12,fontWeight:700,color:C.text,maxWidth:160}}>{p.program}</div>
+                          <span style={{fontSize:10,color:p.status==='Live'?C.green:C.danger,background:(p.status==='Live'?C.green:C.danger)+'20',padding:'2px 6px',borderRadius:4}}>{p.status}</span>
+                        </div>
+                        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6}}>
+                          {[
+                            {l:'TOTAL GWP',   v:cr(p.totalGwp),  c:PALETTE[i%PALETTE.length]},
+                            {l:'FY2026 GWP',  v:cr(p.fy26Gwp),   c:C.dim},
+                            {l:'TOTAL NOP',   v:fmtNop(p.totalNop), c:C.dim},
+                            {l:'3M TREND',    v:`${t3m>0?'+':''}${t3m}%`, c:t3m>=0?C.green:C.danger},
+                          ].map(({l,v,c})=>(
+                            <div key={l}>
+                              <div style={{fontSize:9,color:C.muted}}>{l}</div>
+                              <div style={{fontSize:13,fontWeight:700,color:c}}>{v}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── RISK INTEL TAB ── */}
+        {tab==='risk' && (
+          <div>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:12}}>
+              {[
+                {label:'Concentration Risk', value:top3Pct>70?'CRITICAL':'MODERATE', sub:`Top 3 = ${top3Pct.toFixed(0)}% GWP`, color:top3Pct>70?C.danger:C.yellow, icon:'🔴'},
+                {label:'Churn Programs',     value:kpis.churn, sub:`${((kpis.churn/(kpis.active+kpis.churn))*100).toFixed(0)}% churn rate`, color:C.danger, icon:'⚡'},
+                {label:'Declining (Live)',   value:declining.length, sub:'3-month neg. trend', color:C.yellow, icon:'📉'},
+                {label:'Feb 2026 GWP',       value:crFull(kpis.feb26), sub:`vs Jan: ${kpis.mom>0?'+':''}${kpis.mom.toFixed(1)}%`, color:kpis.mom>=0?C.green:C.danger, icon:'📅'},
+              ].map(({label,value,sub,color,icon})=>(
+                <div key={label} className="card" style={{padding:16,border:`1px solid ${color}40`}}>
+                  <div style={{fontSize:20,marginBottom:6}}>{icon}</div>
+                  <div style={{fontSize:11,color:C.muted,textTransform:'uppercase',letterSpacing:.5}}>{label}</div>
+                  <div style={{fontSize:22,fontWeight:800,color,marginTop:4}}>{value}</div>
+                  <div style={{fontSize:11,color:C.muted,marginTop:4}}>{sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+              <div className="card" style={{padding:18,border:`1px solid ${C.yellow}30`}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.yellow,marginBottom:14}}>📉 Declining Programs — 3-Month Trend</div>
+                {declining.length===0
+                  ? <div style={{color:C.muted,fontSize:13}}>No live programs with 3-month declining trend.</div>
+                  : declining.map(p=>{
+                      const l3 = p.recentGwp.slice(-6).filter(v=>v>0).slice(-3);
+                      return (
+                        <div key={p.program} style={{padding:'10px 0',borderBottom:`1px solid ${C.border}`}}>
+                          <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                            <div>
+                              <div style={{fontSize:13,fontWeight:700,color:C.text}}>{p.client}</div>
+                              <div style={{fontSize:11,color:C.muted}}>{p.program} · {p.vertical}</div>
+                            </div>
+                            <span style={{fontSize:14,fontWeight:800,color:C.danger}}>{p.drop}%</span>
+                          </div>
+                          <div style={{display:'flex',gap:8,marginTop:8}}>
+                            {l3.map((v,j)=>(
+                              <div key={j} style={{flex:1,background:C.surface,borderRadius:6,padding:'6px 8px'}}>
+                                <div style={{fontSize:9,color:C.muted,marginBottom:2}}>M-{3-j}</div>
+                                <div style={{fontSize:12,fontWeight:700,color:j===2?C.danger:C.dim}}>₹{(v/1e5).toFixed(0)}L</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })
+                }
+              </div>
+              <div className="card" style={{padding:18,border:`1px solid ${C.danger}30`}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.danger,marginBottom:14}}>⚡ Churned Programs — Revenue Lost</div>
+                <div style={{display:'flex',gap:8,marginBottom:14}}>
+                  {[
+                    {label:'Programs Churned', value:programs.filter(p=>p.status==='Churn').length, color:C.danger},
+                    {label:'GWP Lost',          value:cr(programs.filter(p=>p.status==='Churn').reduce((s,p)=>s+p.totalGwp,0)), color:C.yellow},
+                    {label:'Churn Rate',        value:`${(programs.filter(p=>p.status==='Churn').length/programs.length*100).toFixed(0)}%`, color:C.danger},
+                  ].map(({label,value,color})=>(
+                    <div key={label} style={{flex:1,background:C.surface,borderRadius:8,padding:'10px 12px'}}>
+                      <div style={{fontSize:10,color:C.muted}}>{label}</div>
+                      <div style={{fontSize:16,fontWeight:800,color}}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+                {programs.filter(p=>p.status==='Churn').sort((a,b)=>b.totalGwp-a.totalGwp).slice(0,7).map((p,i)=>(
+                  <div key={p.program+i} style={{display:'flex',justifyContent:'space-between',padding:'7px 0',borderBottom:`1px solid ${C.border}`,alignItems:'center'}}>
+                    <div>
+                      <div style={{fontSize:12,fontWeight:600,color:C.dim}}>{p.client}</div>
+                      <div style={{fontSize:10,color:C.muted}}>{p.program} · {p.vertical}</div>
+                    </div>
+                    <span style={{fontSize:13,fontWeight:800,color:C.danger}}>{cr(p.totalGwp)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── PODS TAB ── */}
+        {tab==='pods' && (
+          <div>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,marginBottom:12}}>
+              {podData.slice(0,3).map((p,i)=>{
+                const medals=['🥇','🥈','🥉']; const colors=[C.green,C.yellow,C.accent];
+                return (
+                  <div key={p.pod} className="card" style={{padding:20,border:`1px solid ${colors[i]}40`}}>
+                    <div style={{fontSize:28,marginBottom:6}}>{medals[i]}</div>
+                    <div style={{fontSize:20,fontWeight:800,color:colors[i]}}>{p.pod}</div>
+                    <div style={{fontSize:11,color:C.muted,marginBottom:12}}>Pod Lead</div>
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                      {[
+                        {l:'Total GWP',    v:cr(p.gwp),    c:colors[i]},
+                        {l:'FY2026 GWP',   v:cr(p.ytd),    c:C.dim},
+                        {l:'Active',       v:p.active,     c:C.green},
+                        {l:'Churned',      v:p.churn,      c:C.danger},
+                      ].map(({l,v,c})=>(
+                        <div key={l} style={{background:C.surface,borderRadius:8,padding:'8px 10px'}}>
+                          <div style={{fontSize:10,color:C.muted}}>{l}</div>
+                          <div style={{fontSize:15,fontWeight:800,color:c}}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+              <div className="card" style={{padding:18}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:14}}>Pod GWP Comparison</div>
+                <ResponsiveContainer width="100%" height={220}>
+                  <BarChart data={podData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#d0dde8"/>
+                    <XAxis dataKey="pod" tick={{fontSize:11,fill:C.dim}}/>
+                    <YAxis tick={{fontSize:9,fill:C.muted}} tickFormatter={v=>`₹${v.toFixed(0)}Cr`}/>
+                    <Tooltip formatter={v=>cr(v*1e7)}/>
+                    <Bar dataKey={d=>d.gwp/1e7} name="Total GWP" radius={[4,4,0,0]}>
+                      {podData.map((_,i)=><Cell key={i} fill={PALETTE[i%PALETTE.length]}/>)}
+                    </Bar>
+                    <Bar dataKey={d=>d.ytd/1e7} name="FY2026 GWP" fill={C.green+'50'} radius={[4,4,0,0]}/>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="card" style={{padding:18}}>
+                <div style={{fontSize:13,fontWeight:700,color:C.dim,marginBottom:14}}>All Live Programs — by GWP</div>
+                <div style={{overflowY:'auto',maxHeight:260}}>
+                  <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                    <thead style={{position:'sticky',top:0,background:C.card}}>
+                      <tr>{['Client','Program','Pod','GWP','Status'].map(h=>(
+                        <th key={h} style={{padding:'6px 8px',color:C.muted,fontWeight:600,textAlign:'left',borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                      ))}</tr>
+                    </thead>
+                    <tbody>
+                      {filtered.filter(p=>p.status==='Live').sort((a,b)=>b.totalGwp-a.totalGwp).slice(0,25).map((p,i)=>(
+                        <tr key={p.program+i} className="row-hover">
+                          <td style={{padding:'6px 8px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{p.client}</td>
+                          <td style={{padding:'6px 8px',color:C.muted,borderBottom:`1px solid ${C.border}`,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.program}</td>
+                          <td style={{padding:'6px 8px',color:C.muted,borderBottom:`1px solid ${C.border}`}}>{p.podLead}</td>
+                          <td style={{padding:'6px 8px',fontWeight:700,color:C.green,borderBottom:`1px solid ${C.border}`}}>{cr(p.totalGwp)}</td>
+                          <td style={{padding:'6px 8px',borderBottom:`1px solid ${C.border}`}}>
+                            <span style={{fontSize:9,color:C.green,background:C.green+'20',padding:'2px 6px',borderRadius:3}}>Live</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </div>
+
+      {/* FOOTER */}
+      <div style={{borderTop:`1px solid ${C.border}`,padding:'12px 28px',textAlign:'center',marginTop:20}}>
+        <span style={{fontSize:11,color:C.muted}}>
+          Symbo Partner Intelligence · Live from Google Sheets · Jan 2021 – Feb 2026 ·
+          {lastRefresh && ` Last refreshed: ${lastRefresh}`}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
